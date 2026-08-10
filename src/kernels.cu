@@ -1,6 +1,7 @@
 #include <cfloat>
 #include <cmath>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 #include <cuda_fp16.h>
 
@@ -40,6 +41,34 @@ __device__ __forceinline__ float warpReduceSum(float value) {
     value += __shfl_down_sync(0xffffffffu, value, offset);
   }
   return value;
+}
+
+template <typename T, int ValuesPerLane>
+__device__ __forceinline__ float attentionDot(
+    const T* query, size_t query_offset,
+    const float (&query_values)[ValuesPerLane], const T* key,
+    size_t key_offset, int head_dim, int lane) {
+  if constexpr (std::is_same<T, float>::value) {
+    float dot = 0.0f;
+    if (lane == 0) {
+      for (int dimension = 0; dimension < head_dim; ++dimension) {
+        dot = fmaf(query[query_offset + dimension],
+                   key[key_offset + dimension], dot);
+      }
+    }
+    return dot;
+  } else {
+    float dot = 0.0f;
+#pragma unroll
+    for (int value_index = 0; value_index < ValuesPerLane; ++value_index) {
+      const int dimension = lane + value_index * kWarpSize;
+      if (dimension < head_dim) {
+        dot = fmaf(query_values[value_index],
+                   toFloat(key[key_offset + dimension]), dot);
+      }
+    }
+    return warpReduceSum(dot);
+  }
 }
 
 template <int BlockSize>
@@ -136,11 +165,31 @@ __global__ void flashAttentionKernel(
 
   float row_max = -FLT_MAX;
   float row_sum = 0.0f;
-  const float scale = rsqrtf(static_cast<float>(head_dim));
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
   const int visible_sources =
       is_causal && target_index + 1 < src_seq_len
           ? target_index + 1
           : src_seq_len;
+
+  // Use the same stable three-pass structure as the mathematical reference:
+  // first find the row maximum, then the softmax denominator, and finally the
+  // weighted value sum. This avoids repeatedly rescaling a partially
+  // accumulated output, whose rounding error is visible for float inputs.
+  for (int source_index = 0; source_index < visible_sources;
+       ++source_index) {
+    const size_t kv_offset =
+        ((static_cast<size_t>(batch) * src_seq_len + source_index) *
+             kv_heads +
+         kv_head) *
+        head_dim;
+
+    const float dot = attentionDot<T, ValuesPerLane>(
+        query, query_offset, query_values, key, kv_offset, head_dim, lane);
+    if (lane == 0) {
+      row_max = fmaxf(row_max, dot * scale);
+    }
+  }
+  row_max = __shfl_sync(0xffffffffu, row_max, 0);
 
   for (int source_index = 0; source_index < visible_sources;
        ++source_index) {
@@ -150,52 +199,46 @@ __global__ void flashAttentionKernel(
          kv_head) *
         head_dim;
 
-    float dot = 0.0f;
-#pragma unroll
-    for (int value_index = 0; value_index < ValuesPerLane; ++value_index) {
-      const int dimension = lane + value_index * kWarpSize;
-      if (dimension < head_dim) {
-        dot += query_values[value_index] *
-               toFloat(key[kv_offset + dimension]);
-      }
-    }
-    dot = warpReduceSum(dot);
-
-    float old_scale = 1.0f;
-    float new_scale = 0.0f;
+    const float dot = attentionDot<T, ValuesPerLane>(
+        query, query_offset, query_values, key, kv_offset, head_dim, lane);
     if (lane == 0) {
-      const float score = dot * scale;
-      if (score > row_max) {
-        old_scale = row_max == -FLT_MAX ? 0.0f : expf(row_max - score);
-        new_scale = 1.0f;
-        row_max = score;
-      } else {
-        new_scale = expf(score - row_max);
-      }
-      row_sum = row_sum * old_scale + new_scale;
-    }
-
-    old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
-    new_scale = __shfl_sync(0xffffffffu, new_scale, 0);
-#pragma unroll
-    for (int value_index = 0; value_index < ValuesPerLane; ++value_index) {
-      const int dimension = lane + value_index * kWarpSize;
-      if (dimension < head_dim) {
-        output_values[value_index] =
-            output_values[value_index] * old_scale +
-            new_scale * toFloat(value[kv_offset + dimension]);
-      }
+      row_sum += expf(dot * scale - row_max);
     }
   }
 
   row_sum = __shfl_sync(0xffffffffu, row_sum, 0);
   const float inverse_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+
+  for (int source_index = 0; source_index < visible_sources;
+       ++source_index) {
+    const size_t kv_offset =
+        ((static_cast<size_t>(batch) * src_seq_len + source_index) *
+             kv_heads +
+         kv_head) *
+        head_dim;
+
+    const float dot = attentionDot<T, ValuesPerLane>(
+        query, query_offset, query_values, key, kv_offset, head_dim, lane);
+    float probability =
+        lane == 0 ? expf(dot * scale - row_max) * inverse_sum : 0.0f;
+    probability = __shfl_sync(0xffffffffu, probability, 0);
+
+    for (int value_index = 0; value_index < ValuesPerLane; ++value_index) {
+      const int dimension = lane + value_index * kWarpSize;
+      if (dimension < head_dim) {
+        output_values[value_index] =
+            fmaf(probability, toFloat(value[kv_offset + dimension]),
+                 output_values[value_index]);
+      }
+    }
+  }
+
 #pragma unroll
   for (int value_index = 0; value_index < ValuesPerLane; ++value_index) {
     const int dimension = lane + value_index * kWarpSize;
     if (dimension < head_dim) {
       output[query_offset + dimension] =
-          fromFloat<T>(output_values[value_index] * inverse_sum);
+          fromFloat<T>(output_values[value_index]);
     }
   }
 }
